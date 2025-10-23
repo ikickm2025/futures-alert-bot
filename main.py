@@ -1,4 +1,4 @@
-# main.py — MNQ/NQ Breakout Bot (24/7 Scanning)
+# main.py — Advanced 24/7 MNQ/NQ Trading Bot
 import os
 import pandas as pd
 import requests
@@ -13,17 +13,21 @@ import pytz
 # ======================
 # CONFIGURATION
 # ======================
-ACCOUNT_SIZE = 25000
-RISK_PERCENT = 0.01
+ACCOUNT_SIZE = 25000          # Adjust to your assumed account size
+RISK_PERCENT = 0.01           # 1% risk per trade
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 GOOGLE_SCRIPT_URL = os.getenv("GOOGLE_SCRIPT_URL", "")
-SYMBOL = "/MNQ"      # Change to "/NQ" if needed
-POINT_VALUE = 2      # MNQ = $2 | NQ = $20
+SYMBOL = "/MNQ"               # Use "/NQ" for NQ
+POINT_VALUE = 2               # MNQ = $2 | NQ = $20
 
 app = Flask(__name__)
 data_client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+# ======================
+# HELPER FUNCTIONS
+# ======================
 
 def get_bars(symbol, minutes=60):
     try:
@@ -34,7 +38,12 @@ def get_bars(symbol, minutes=60):
             limit=minutes
         )
         bars = data_client.get_crypto_bars(request_params).df
-        return bars.reset_index() if not bars.empty else None
+        if bars.empty:
+            return None
+        bars = bars.reset_index()
+        # Ensure timestamp is timezone-aware
+        bars['timestamp'] = pd.to_datetime(bars['timestamp'], utc=True)
+        return bars
     except Exception as e:
         print(f"Alpaca error: {e}")
         return None
@@ -55,17 +64,121 @@ def has_high_impact_news():
     except:
         return False
 
+def get_fear_greed_index():
+    try:
+        url = "https://api.alternative.me/fng/"
+        data = requests.get(url, timeout=5).json()
+        return int(data['data'][0]['value'])
+    except:
+        return 50  # neutral
+
 def is_market_closed():
-    """Skip Friday 5PM ET to Sunday 6PM ET (CME maintenance)"""
     et = pytz.timezone('US/Eastern')
     now_et = datetime.now(et)
-    if now_et.weekday() == 4 and now_et.hour >= 17:  # Friday after 5 PM
+    if now_et.weekday() == 4 and now_et.hour >= 17:  # Friday after 5 PM ET
         return True
     if now_et.weekday() == 5:  # Saturday
         return True
-    if now_et.weekday() == 6 and now_et.hour < 18:  # Sunday before 6 PM
+    if now_et.weekday() == 6 and now_et.hour < 18:  # Sunday before 6 PM ET
         return True
     return False
+
+def calculate_vwap(df):
+    df = df.copy()
+    df['tp'] = (df['high'] + df['low'] + df['close']) / 3
+    df['vwap'] = (df['tp'] * df['volume']).cumsum() / df['volume'].cumsum()
+    return df['vwap'].iloc[-1]
+
+# ======================
+# STRATEGY LOGIC
+# ======================
+
+def check_orb_setup(df, current_time_et):
+    # Only during first 30 mins of RTH
+    if not ((current_time_et.hour == 9 and current_time_et.minute >= 30) or
+            (current_time_et.hour == 10 and current_time_et.minute == 0)):
+        return None
+
+    # Filter bars from 9:30 AM ET onward
+    df_et = df.copy()
+    df_et['timestamp_et'] = df_et['timestamp'].dt.tz_convert('US/Eastern')
+    rth_bars = df_et[df_et['timestamp_et'].dt.hour >= 9]
+    if len(rth_bars) < 5:
+        return None
+
+    orb_bars = rth_bars.head(5)
+    orb_high = orb_bars['high'].max()
+    orb_low = orb_bars['low'].min()
+    current_price = df['close'].iloc[-1]
+    current_vol = df['volume'].iloc[-1]
+    avg_vol = df['volume'][-20:].mean()
+
+    if current_price > orb_high and current_vol > avg_vol * 1.5:
+        return {"type": "long", "price": current_price, "stop": orb_low, "strategy": "ORB"}
+    if current_price < orb_low and current_vol > avg_vol * 1.5:
+        return {"type": "short", "price": current_price, "stop": orb_high, "strategy": "ORB"}
+    return None
+
+def check_vwap_pullback(df):
+    if len(df) < 30:
+        return None
+    try:
+        vwap = calculate_vwap(df)
+        current_price = df['close'].iloc[-1]
+        prev_price = df['close'].iloc[-2]
+        current_vol = df['volume'].iloc[-1]
+        avg_vol = df['volume'][-20:].mean()
+
+        # Uptrend pullback
+        if df['close'].iloc[-5] > vwap and current_price <= vwap and prev_price > vwap and current_vol > avg_vol:
+            stop = df['low'].iloc[-10:].min()
+            return {"type": "long", "price": current_price, "stop": stop, "strategy": "VWAP"}
+        # Downtrend rally
+        if df['close'].iloc[-5] < vwap and current_price >= vwap and prev_price < vwap and current_vol > avg_vol:
+            stop = df['high'].iloc[-10:].max()
+            return {"type": "short", "price": current_price, "stop": stop, "strategy": "VWAP"}
+    except:
+        pass
+    return None
+
+def check_failed_auction(df):
+    if len(df) < 10:
+        return None
+    last3 = df.tail(3)
+    # Bullish thrust → bearish rejection
+    if (last3['close'].iloc[0] < last3['close'].iloc[1] and
+        last3['high'].iloc[1] > last3['high'].iloc[0] and
+        last3['close'].iloc[2] < last3['low'].iloc[1]):
+        stop = last3['high'].max()
+        return {"type": "short", "price": last3['close'].iloc[2], "stop": stop, "strategy": "FailedAuction"}
+    # Bearish thrust → bullish rejection
+    if (last3['close'].iloc[0] > last3['close'].iloc[1] and
+        last3['low'].iloc[1] < last3['low'].iloc[0] and
+        last3['close'].iloc[2] > last3['high'].iloc[1]):
+        stop = last3['low'].min()
+        return {"type": "long", "price": last3['close'].iloc[2], "stop": stop, "strategy": "FailedAuction"}
+    return None
+
+def check_breakout(df):
+    recent = df.tail(50)
+    current_price = recent['close'].iloc[-1]
+    current_vol = recent['volume'].iloc[-1]
+    avg_vol = recent['volume'][-20:].mean()
+    lookback = recent.tail(15)
+    recent_high = lookback['high'].max()
+    recent_low = lookback['low'].min()
+
+    if current_price > recent_high and current_vol > avg_vol * 1.5:
+        stop = recent_low
+        return {"type": "long", "price": current_price, "stop": stop, "strategy": "Breakout"}
+    if current_price < recent_low and current_vol > avg_vol * 1.5:
+        stop = recent_high
+        return {"type": "short", "price": current_price, "stop": stop, "strategy": "Breakout"}
+    return None
+
+# ======================
+# MAIN SIGNAL CHECKER
+# ======================
 
 def check_setup():
     if is_market_closed():
@@ -75,41 +188,63 @@ def check_setup():
         print("🚫 Skipping: High-impact news")
         return None
 
-    df = get_bars(SYMBOL, minutes=60)
+    fg_index = get_fear_greed_index()
+    print(f"🧠 Fear & Greed: {fg_index}")
+
+    df = get_bars(SYMBOL, minutes=70)
     if df is None or len(df) < 20:
         print("⚠️ Not enough data")
         return None
 
-    recent = df.tail(50)
-    current_price = recent['close'].iloc[-1]
-    current_vol = recent['volume'].iloc[-1]
-    avg_vol = recent['volume'][-20:].mean()
+    et = pytz.timezone('US/Eastern')
+    now_et = datetime.now(pytz.utc).astimezone(et)
 
-    lookback = recent.tail(15)
-    recent_high = lookback['high'].max()
-    recent_low = lookback['low'].min()
+    # Try strategies in priority order
+    signal = None
 
-    # Long setup
-    if current_price > recent_high and current_vol > avg_vol * 1.5:
-        stop_dist = max(3, min(10, (current_price - recent_low) / 2))
-        return {
-            "symbol": SYMBOL.replace("/", ""),
-            "direction": "long",
-            "price": round(current_price, 1),
-            "stop_dist": round(stop_dist, 1)
-        }
+    # 1. ORB (only during US open)
+    if 9 <= now_et.hour <= 10:
+        signal = check_orb_setup(df, now_et)
 
-    # Short setup
-    if current_price < recent_low and current_vol > avg_vol * 1.5:
-        stop_dist = max(3, min(10, (recent_high - current_price) / 2))
-        return {
-            "symbol": SYMBOL.replace("/", ""),
-            "direction": "short",
-            "price": round(current_price, 1),
-            "stop_dist": round(stop_dist, 1)
-        }
+    # 2. VWAP Pullback
+    if signal is None:
+        signal = check_vwap_pullback(df)
 
-    return None
+    # 3. Failed Auction
+    if signal is None:
+        signal = check_failed_auction(df)
+
+    # 4. General Breakout (fallback)
+    if signal is None:
+        signal = check_breakout(df)
+
+    if signal is None:
+        return None
+
+    # Apply sentiment filter
+    direction = signal["type"]
+    if direction == "long" and fg_index < 20:
+        print("📉 Skipping long: Extreme fear (F&G < 20)")
+        return None
+    if direction == "short" and fg_index > 80:
+        print("📈 Skipping short: Extreme greed (F&G > 80)")
+        return None
+
+    stop_dist = abs(signal["price"] - signal["stop"])
+    stop_dist = max(2, min(12, stop_dist))  # clamp
+
+    return {
+        "symbol": SYMBOL.replace("/", ""),
+        "direction": direction,
+        "price": round(signal["price"], 1),
+        "stop_dist": round(stop_dist, 1),
+        "sentiment": fg_index,
+        "strategy": signal["strategy"]
+    }
+
+# ======================
+# ALERT & LOGGING
+# ======================
 
 def send_discord_alert(trade):
     if not DISCORD_WEBHOOK_URL:
@@ -119,7 +254,7 @@ def send_discord_alert(trade):
         "title": f"{'🟢 LONG' if trade['direction'] == 'long' else '🔴 SHORT'} {trade['symbol']}",
         "description": f"Entry: {trade['price']}\nStop: {trade['price'] - trade['stop_dist'] if trade['direction']=='long' else trade['price'] + trade['stop_dist']}\nStop Dist: {trade['stop_dist']} pts",
         "color": color,
-        "footer": {"text": "24/7 MNQ Breakout Bot • Volume Confirmed"}
+        "footer": {"text": f"{trade['strategy']} • F&G: {trade['sentiment']} • Volume Confirmed"}
     }
     try:
         requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=5)
@@ -139,15 +274,18 @@ def log_to_sheets(trade):
         "stop_dist": trade["stop_dist"],
         "contracts": contracts,
         "risk": round(risk_amount, 2),
-        "notes": "24/7 breakout signal"
+        "notes": f"{trade['strategy']} | F&G:{trade['sentiment']}"
     }
     try:
         requests.post(GOOGLE_SCRIPT_URL, json=payload, timeout=5)
     except:
         pass
 
+# ======================
+# SCHEDULER & ENDPOINTS
+# ======================
+
 def scan_and_alert():
-    """Scan 24/7 (except weekend maintenance)"""
     print(f"🔍 Scanning at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     trade = check_setup()
     if trade:
@@ -157,14 +295,13 @@ def scan_and_alert():
     else:
         print("⏸️ No signal")
 
-# Run every 2 minutes, 24/7
 scheduler = BackgroundScheduler()
 scheduler.add_job(scan_and_alert, 'interval', minutes=2)
 scheduler.start()
 
 @app.route('/')
 def home():
-    return "24/7 MNQ Breakout Bot is running!"
+    return "Advanced MNQ/NQ Bot — Running 24/7"
 
 @app.route('/trigger', methods=['POST'])
 def manual_trigger():
