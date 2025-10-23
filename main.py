@@ -261,6 +261,21 @@ def send_discord_alert(trade):
     except:
         pass
 
+def send_startup_message():
+    """Send a message to Discord when the bot starts up"""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    embed = {
+        "title": "✅ MNQ/NQ Bot Started",
+        "description": "24/7 breakout scanner is now active.\nScanning every 2 minutes.",
+        "color": 0x00ff00,
+        "footer": {"text": f"Deployed at {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"}
+    }
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=5)
+    except Exception as e:
+        print(f"Failed to send startup message: {e}")
+
 def log_to_sheets(trade):
     if not GOOGLE_SCRIPT_URL:
         return
@@ -296,8 +311,11 @@ def scan_and_alert():
         print("⏸️ No signal")
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(scan_and_alert, 'interval', minutes=2)
+scheduler.add_job(scan_and_alert, 'interval', minutes=1)
 scheduler.start()
+
+# Send startup notification
+send_startup_message()
 
 @app.route('/')
 def home():
