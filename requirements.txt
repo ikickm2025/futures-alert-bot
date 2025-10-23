@@ -1,6 +1,6 @@
 Flask==3.0.3
 requests==2.32.3
-pandas==2.2.2
+pandas==2.2.1        # or 2.1.4 (more stable)
 apscheduler==3.10.4
 alpaca-py==0.17.0
 pytz==2024.1
