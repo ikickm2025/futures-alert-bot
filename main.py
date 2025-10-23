@@ -1,6 +1,5 @@
-# main.py
+# main.py — MNQ/NQ Breakout Bot (24/7 Scanning)
 import os
-import json
 import pandas as pd
 import requests
 from datetime import datetime, timedelta
@@ -12,24 +11,21 @@ from alpaca.data.timeframe import TimeFrame
 import pytz
 
 # ======================
-# CONFIGURATION (SET ONCE)
+# CONFIGURATION
 # ======================
-ACCOUNT_SIZE = 25000          # Your assumed account size
-RISK_PERCENT = 0.01           # 1% risk per trade
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "YOUR_ALPACA_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "YOUR_ALPACA_SECRET")
+ACCOUNT_SIZE = 25000
+RISK_PERCENT = 0.01
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 GOOGLE_SCRIPT_URL = os.getenv("GOOGLE_SCRIPT_URL", "")
-SYMBOL = "/MNQ"               # Use "/NQ" for NQ, "/MNQ" for Micro
-POINT_VALUE = 2               # MNQ = $2/point, NQ = $20
+SYMBOL = "/MNQ"      # Change to "/NQ" if needed
+POINT_VALUE = 2      # MNQ = $2 | NQ = $20
 
 app = Flask(__name__)
-
-# Alpaca client (free market data)
 data_client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-def get_bars(symbol, minutes=50):
-    """Fetch 1-min bars from Alpaca (free)"""
+def get_bars(symbol, minutes=60):
     try:
         request_params = CryptoBarsRequest(
             symbol_or_symbols=symbol,
@@ -38,40 +34,45 @@ def get_bars(symbol, minutes=50):
             limit=minutes
         )
         bars = data_client.get_crypto_bars(request_params).df
-        if bars.empty:
-            return None
-        bars = bars.reset_index()
-        return bars
+        return bars.reset_index() if not bars.empty else None
     except Exception as e:
         print(f"Alpaca error: {e}")
         return None
 
 def has_high_impact_news():
-    """Check for high-impact news in next 15 mins"""
     try:
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        response = requests.get(url, timeout=5)
-        events = response.json()
+        events = requests.get(url, timeout=5).json()
         now = datetime.utcnow()
         for e in events:
-            if not e.get('date'):
-                continue
+            if not e.get('date'): continue
             try:
                 event_time = datetime.fromisoformat(e['date'].replace('Z', '+00:00'))
-            except:
-                continue
-            diff_sec = (event_time - now).total_seconds()
-            if 0 <= diff_sec <= 900:  # next 15 mins
-                if e.get('impact') == 'High':
-                    return True
+            except: continue
+            if 0 <= (event_time - now).total_seconds() <= 900 and e.get('impact') == 'High':
+                return True
         return False
     except:
-        return False  # If API fails, assume no news
+        return False
+
+def is_market_closed():
+    """Skip Friday 5PM ET to Sunday 6PM ET (CME maintenance)"""
+    et = pytz.timezone('US/Eastern')
+    now_et = datetime.now(et)
+    if now_et.weekday() == 4 and now_et.hour >= 17:  # Friday after 5 PM
+        return True
+    if now_et.weekday() == 5:  # Saturday
+        return True
+    if now_et.weekday() == 6 and now_et.hour < 18:  # Sunday before 6 PM
+        return True
+    return False
 
 def check_setup():
-    """Main strategy logic: breakout with volume confirmation"""
+    if is_market_closed():
+        print("🌙 Market closed (weekend)")
+        return None
     if has_high_impact_news():
-        print("🚫 Skipping: High-impact news detected")
+        print("🚫 Skipping: High-impact news")
         return None
 
     df = get_bars(SYMBOL, minutes=60)
@@ -79,21 +80,18 @@ def check_setup():
         print("⚠️ Not enough data")
         return None
 
-    # Use last 50 bars for analysis
-    recent = df.tail(50).copy()
+    recent = df.tail(50)
     current_price = recent['close'].iloc[-1]
     current_vol = recent['volume'].iloc[-1]
     avg_vol = recent['volume'][-20:].mean()
 
-    # Define lookback window (last 15 mins)
     lookback = recent.tail(15)
     recent_high = lookback['high'].max()
     recent_low = lookback['low'].min()
 
-    # Long: price > recent high + volume surge
+    # Long setup
     if current_price > recent_high and current_vol > avg_vol * 1.5:
-        stop_dist = (current_price - recent_low) / 2  # half the range
-        stop_dist = max(3, min(10, stop_dist))  # clamp between 3-10 points
+        stop_dist = max(3, min(10, (current_price - recent_low) / 2))
         return {
             "symbol": SYMBOL.replace("/", ""),
             "direction": "long",
@@ -101,10 +99,9 @@ def check_setup():
             "stop_dist": round(stop_dist, 1)
         }
 
-    # Short: price < recent low + volume surge
+    # Short setup
     if current_price < recent_low and current_vol > avg_vol * 1.5:
-        stop_dist = (recent_high - current_price) / 2
-        stop_dist = max(3, min(10, stop_dist))
+        stop_dist = max(3, min(10, (recent_high - current_price) / 2))
         return {
             "symbol": SYMBOL.replace("/", ""),
             "direction": "short",
@@ -122,9 +119,12 @@ def send_discord_alert(trade):
         "title": f"{'🟢 LONG' if trade['direction'] == 'long' else '🔴 SHORT'} {trade['symbol']}",
         "description": f"Entry: {trade['price']}\nStop: {trade['price'] - trade['stop_dist'] if trade['direction']=='long' else trade['price'] + trade['stop_dist']}\nStop Dist: {trade['stop_dist']} pts",
         "color": color,
-        "footer": {"text": "MNQ/NQ Breakout Bot • R:1% • Volume Confirmed"}
+        "footer": {"text": "24/7 MNQ Breakout Bot • Volume Confirmed"}
     }
-    requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]})
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=5)
+    except:
+        pass
 
 def log_to_sheets(trade):
     if not GOOGLE_SCRIPT_URL:
@@ -139,7 +139,7 @@ def log_to_sheets(trade):
         "stop_dist": trade["stop_dist"],
         "contracts": contracts,
         "risk": round(risk_amount, 2),
-        "notes": "Auto breakout signal"
+        "notes": "24/7 breakout signal"
     }
     try:
         requests.post(GOOGLE_SCRIPT_URL, json=payload, timeout=5)
@@ -147,14 +147,8 @@ def log_to_sheets(trade):
         pass
 
 def scan_and_alert():
-    """Run every 2 minutes during market hours"""
-    et = pytz.timezone('US/Eastern')
-    now_et = datetime.now(et)
-    # Only scan during RTH: 9:30 AM – 4:00 PM ET
-    if not (9 <= now_et.hour < 16):
-        return
-
-    print(f"🔍 Scanning at {now_et.strftime('%H:%M:%S ET')}")
+    """Scan 24/7 (except weekend maintenance)"""
+    print(f"🔍 Scanning at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     trade = check_setup()
     if trade:
         print(f"✅ Signal: {trade}")
@@ -163,17 +157,15 @@ def scan_and_alert():
     else:
         print("⏸️ No signal")
 
-# Background scheduler
+# Run every 2 minutes, 24/7
 scheduler = BackgroundScheduler()
 scheduler.add_job(scan_and_alert, 'interval', minutes=2)
 scheduler.start()
 
-# Health check endpoint
 @app.route('/')
 def home():
-    return "MNQ/NQ Breakout Bot is running!"
+    return "24/7 MNQ Breakout Bot is running!"
 
-# Manual trigger (optional)
 @app.route('/trigger', methods=['POST'])
 def manual_trigger():
     trade = check_setup()
